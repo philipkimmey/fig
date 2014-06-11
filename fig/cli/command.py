@@ -85,11 +85,21 @@ class Command(DocoptCommand):
         return Formatter()
 
     def check_yaml_filename(self):
-        if os.path.exists(os.path.join(self.base_dir, 'fig.yaml')):
-
-            log.warning("Fig just read the file 'fig.yaml' on startup, rather than 'fig.yml'")
-            log.warning("Please be aware that fig.yml the expected extension in most cases, and using .yaml can cause compatibility issues in future")
-
-            return os.path.join(self.base_dir, 'fig.yaml')
-        else:
-            return os.path.join(self.base_dir, 'fig.yml')
+        abs_path = os.path.abspath(self.base_dir)
+        while abs_path != '/':
+            if os.path.exists(os.path.join(abs_path, 'fig.yaml')):
+                log.warning(
+                    "Fig just read the file 'fig.yaml'"
+                    " on startup, rather than 'fig.yml'")
+                log.warning(
+                    "Please be aware that .yml is the expected extension"
+                    " and using .yaml can may cause compatibility issues")
+                self.base_dir = abs_path
+                self.explicit_project_name = os.path.split(abs_path)[-1]
+                return os.path.join(abs_path, 'fig.yaml')
+            elif os.path.exists(os.path.join(abs_path, 'fig.yml')):
+                self.base_dir = abs_path
+                self.explicit_project_name = os.path.split(abs_path)[-1]
+                return os.path.join(abs_path, 'fig.yml')
+            else:
+                abs_path = os.path.dirname(abs_path)
