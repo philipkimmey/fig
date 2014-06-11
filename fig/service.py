@@ -37,7 +37,7 @@ class ConfigError(ValueError):
 
 
 class Service(object):
-    def __init__(self, name, client=None, project='default', links=[], **options):
+    def __init__(self, name, client=None, project='default', links=[], base_dir='.', **options):
         if not re.match('^[a-zA-Z0-9]+$', name):
             raise ConfigError('Invalid name: %s' % name)
         if not re.match('^[a-zA-Z0-9]+$', project):
@@ -58,6 +58,7 @@ class Service(object):
         self.client = client
         self.project = project
         self.links = links or []
+        self.base_dir = base_dir
         self.options = options
 
     def containers(self, stopped=False, one_off=False):
@@ -223,7 +224,9 @@ class Service(object):
             for volume in options['volumes']:
                 if ':' in volume:
                     external_dir, internal_dir = volume.split(':')
-                    volume_bindings[os.path.abspath(external_dir)] = {
+                    external_dir = os.path.join(self.base_dir, external_dir)
+                    external_dir = os.path.abspath(external_dir)
+                    volume_bindings[external_dir] = {
                         'bind': internal_dir,
                         'ro': False,
                     }

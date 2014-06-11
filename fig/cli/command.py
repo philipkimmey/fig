@@ -66,7 +66,11 @@ class Command(DocoptCommand):
             raise errors.UserError(six.text_type(e))
 
         try:
-            return Project.from_config(self.project_name, config, self.client)
+            return Project.from_config(
+                self.project_name,
+                config,
+                self.client,
+                self.base_dir)
         except ConfigError as e:
             raise errors.UserError(six.text_type(e))
 

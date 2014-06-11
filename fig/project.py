@@ -34,17 +34,19 @@ def sort_service_dicts(services):
 
     return sorted_services
 
+
 class Project(object):
     """
     A collection of services.
     """
-    def __init__(self, name, services, client):
+    def __init__(self, name, services, client, base_dir="."):
         self.name = name
         self.services = services
         self.client = client
+        self.base_dir = base_dir
 
     @classmethod
-    def from_dicts(cls, name, service_dicts, client):
+    def from_dicts(cls, name, service_dicts, client, base_dir="."):
         """
         Construct a ServiceCollection from a list of dicts representing services.
         """
@@ -64,18 +66,24 @@ class Project(object):
                         raise ConfigurationError('Service "%s" has a link to service "%s" which does not exist.' % (service_dict['name'], service_name))
 
                 del service_dict['links']
-            project.services.append(Service(client=client, project=name, links=links, **service_dict))
+            project.services.append(
+                Service(
+                    client=client,
+                    project=name,
+                    links=links,
+                    base_dir=base_dir,
+                    **service_dict))
         return project
 
     @classmethod
-    def from_config(cls, name, config, client):
+    def from_config(cls, name, config, client, base_dir="."):
         dicts = []
         for service_name, service in list(config.items()):
             if not isinstance(service, dict):
                 raise ConfigurationError('Service "%s" doesn\'t have any configuration options. All top level keys in your fig.yml must map to a dictionary of configuration options.')
             service['name'] = service_name
             dicts.append(service)
-        return cls.from_dicts(name, dicts, client)
+        return cls.from_dicts(name, dicts, client, base_dir)
 
     def get_service(self, name):
         """
