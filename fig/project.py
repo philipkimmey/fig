@@ -2,6 +2,8 @@ from __future__ import unicode_literals
 from __future__ import absolute_import
 import logging
 from .service import Service
+from .container import Container
+from .packages.docker.errors import APIError
 
 log = logging.getLogger(__name__)
 
@@ -18,11 +20,13 @@ def sort_service_dicts(services):
         if n['name'] in temporary_marked:
             if n['name'] in get_service_names(n.get('links', [])):
                 raise DependencyError('A service can not link to itself: %s' % n['name'])
+            if n['name'] in n.get('volumes_from', []):
+                raise DependencyError('A service can not mount itself as volume: %s' % n['name'])
             else:
                 raise DependencyError('Circular import between %s' % ' and '.join(temporary_marked))
         if n in unmarked:
             temporary_marked.add(n['name'])
-            dependents = [m for m in services if n['name'] in get_service_names(m.get('links', []))]
+            dependents = [m for m in services if (n['name'] in get_service_names(m.get('links', []))) or (n['name'] in m.get('volumes_from', []))]
             for m in dependents:
                 visit(m)
             temporary_marked.remove(n['name'])
@@ -52,25 +56,15 @@ class Project(object):
         """
         project = cls(name, [], client)
         for service_dict in sort_service_dicts(service_dicts):
-            # Reference links by object
-            links = []
-            if 'links' in service_dict:
-                for link in service_dict.get('links', []):
-                    if ':' in link:
-                        service_name, link_name = link.split(':', 1)
-                    else:
-                        service_name, link_name = link, None
-                    try:
-                        links.append((project.get_service(service_name), link_name))
-                    except NoSuchService:
-                        raise ConfigurationError('Service "%s" has a link to service "%s" which does not exist.' % (service_dict['name'], service_name))
+            links = project.get_links(service_dict)
+            volumes_from = project.get_volumes_from(service_dict)
 
-                del service_dict['links']
             project.services.append(
                 Service(
                     client=client,
                     project=name,
                     links=links,
+                    volumes_from=volumes_from,
                     base_dir=base_dir,
                     **service_dict))
         return project
@@ -96,22 +90,66 @@ class Project(object):
 
         raise NoSuchService(name)
 
-    def get_services(self, service_names=None):
+    def get_services(self, service_names=None, include_links=False):
         """
         Returns a list of this project's services filtered
-        by the provided list of names, or all services if
-        service_names is None or [].
+        by the provided list of names, or all services if service_names is None
+        or [].
 
-        Preserves the original order of self.services.
+        If include_links is specified, returns a list including the links for
+        service_names, in order of dependency.
 
-        Raises NoSuchService if any of the named services
-        do not exist.
+        Preserves the original order of self.services where possible,
+        reordering as needed to resolve links.
+
+        Raises NoSuchService if any of the named services do not exist.
         """
         if service_names is None or len(service_names) == 0:
-            return self.services
+            return self.get_services(
+                service_names=[s.name for s in self.services],
+                include_links=include_links
+            )
         else:
             unsorted = [self.get_service(name) for name in service_names]
-            return [s for s in self.services if s in unsorted]
+            services = [s for s in self.services if s in unsorted]
+
+            if include_links:
+                services = reduce(self._inject_links, services, [])
+
+            uniques = []
+            [uniques.append(s) for s in services if s not in uniques]
+            return uniques
+
+    def get_links(self, service_dict):
+        links = []
+        if 'links' in service_dict:
+            for link in service_dict.get('links', []):
+                if ':' in link:
+                    service_name, link_name = link.split(':', 1)
+                else:
+                    service_name, link_name = link, None
+                try:
+                    links.append((self.get_service(service_name), link_name))
+                except NoSuchService:
+                    raise ConfigurationError('Service "%s" has a link to service "%s" which does not exist.' % (service_dict['name'], service_name))
+            del service_dict['links']
+        return links
+
+    def get_volumes_from(self, service_dict):
+        volumes_from = []
+        if 'volumes_from' in service_dict:
+            for volume_name in service_dict.get('volumes_from', []):
+                try:
+                    service = self.get_service(volume_name)
+                    volumes_from.append(service)
+                except NoSuchService:
+                    try:
+                        container = Container.from_id(client, volume_name)
+                        volumes_from.append(Container.from_id(client, volume_name))
+                    except APIError:
+                        raise ConfigurationError('Service "%s" mounts volumes from "%s", which is not the name of a service or container.' % (service_dict['name'], volume_name))
+            del service_dict['volumes_from']
+        return volumes_from
 
     def start(self, service_names=None, **options):
         for service in self.get_services(service_names):
@@ -132,14 +170,18 @@ class Project(object):
             else:
                 log.info('%s uses an image, skipping' % service.name)
 
-    def up(self, service_names=None):
-        new_containers = []
+    def up(self, service_names=None, start_links=True, recreate=True):
+        running_containers = []
 
-        for service in self.get_services(service_names):
-            for (_, new) in service.recreate_containers():
-                new_containers.append(new)
+        for service in self.get_services(service_names, include_links=start_links):
+            if recreate:
+                for (_, container) in service.recreate_containers():
+                    running_containers.append(container)
+            else:
+                for container in service.start_or_create_containers():
+                    running_containers.append(container)
 
-        return new_containers
+        return running_containers
 
     def remove_stopped(self, service_names=None, **options):
         for service in self.get_services(service_names):
@@ -151,6 +193,20 @@ class Project(object):
             for container in service.containers(*args, **kwargs):
                 l.append(container)
         return l
+
+    def _inject_links(self, acc, service):
+        linked_names = service.get_linked_names()
+
+        if len(linked_names) > 0:
+            linked_services = self.get_services(
+                service_names=linked_names,
+                include_links=True
+            )
+        else:
+            linked_services = []
+
+        linked_services.append(service)
+        return acc + linked_services
 
 
 class NoSuchService(Exception):

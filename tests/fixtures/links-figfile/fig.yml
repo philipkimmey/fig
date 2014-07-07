@@ -1,6 +1,11 @@
-simple:
+db:
   image: busybox:latest
   command: /bin/sleep 300
-another:
+web:
+  image: busybox:latest
+  command: /bin/sleep 300
+  links:
+    - db:db
+console:
   image: busybox:latest
   command: /bin/sleep 300

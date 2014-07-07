@@ -2,6 +2,7 @@ from __future__ import unicode_literals
 from __future__ import absolute_import
 from fig import Service
 from fig.service import CannotBeScaledError
+from fig.container import Container
 from fig.packages.docker.errors import APIError
 from .testcases import DockerClientTestCase
 
@@ -96,6 +97,16 @@ class ServiceTest(DockerClientTestCase):
         service.start_container(container)
         self.assertIn('/host-tmp', container.inspect()['Volumes'])
 
+    def test_create_container_with_volumes_from(self):
+        volume_service = self.create_service('data')
+        volume_container_1 = volume_service.create_container()
+        volume_container_2 = Container.create(self.client, image='busybox:latest', command=["/bin/sleep", "300"])
+        host_service = self.create_service('host', volumes_from=[volume_service, volume_container_2])
+        host_container = host_service.create_container()
+        host_service.start_container(host_container)
+        self.assertIn(volume_container_1.id, host_container.inspect()['HostConfig']['VolumesFrom'])
+        self.assertIn(volume_container_2.id, host_container.inspect()['HostConfig']['VolumesFrom'])
+
     def test_recreate_containers(self):
         service = self.create_service(
             'db',
@@ -127,6 +138,7 @@ class ServiceTest(DockerClientTestCase):
         self.assertIn('FOO=2', new_container.dictionary['Config']['Env'])
         self.assertEqual(new_container.name, 'figtest_db_1')
         self.assertEqual(new_container.inspect()['Volumes']['/var/db'], volume_path)
+        self.assertIn(intermediate_container.id, new_container.dictionary['HostConfig']['VolumesFrom'])
 
         self.assertEqual(len(self.client.containers(all=True)), num_containers_before)
         self.assertNotEqual(old_container.id, new_container.id)
@@ -231,6 +243,27 @@ class ServiceTest(DockerClientTestCase):
         self.assertIn('8000/tcp', container['NetworkSettings']['Ports'])
         self.assertEqual(container['NetworkSettings']['Ports']['8000/tcp'][0]['HostPort'], '8001')
 
+    def test_port_with_explicit_interface(self):
+        service = self.create_service('web', ports=[
+            '127.0.0.1:8001:8000',
+            '0.0.0.0:9001:9000',
+        ])
+        container = service.start_container().inspect()
+        self.assertEqual(container['NetworkSettings']['Ports'], {
+            '8000/tcp': [
+                {
+                    'HostIp': '127.0.0.1',
+                    'HostPort': '8001',
+                },
+            ],
+            '9000/tcp': [
+                {
+                    'HostIp': '0.0.0.0',
+                    'HostPort': '9001',
+                },
+            ],
+        })
+
     def test_scale(self):
         service = self.create_service('web')
         service.scale(1)
@@ -253,3 +286,18 @@ class ServiceTest(DockerClientTestCase):
         self.assertEqual(len(containers), 2)
         for container in containers:
             self.assertEqual(list(container.inspect()['HostConfig']['PortBindings'].keys()), ['8000/tcp'])
+
+    def test_network_mode_none(self):
+        service = self.create_service('web', net='none')
+        container = service.start_container().inspect()
+        self.assertEqual(container['HostConfig']['NetworkMode'], 'none')
+
+    def test_network_mode_bridged(self):
+        service = self.create_service('web', net='bridge')
+        container = service.start_container().inspect()
+        self.assertEqual(container['HostConfig']['NetworkMode'], 'bridge')
+
+    def test_network_mode_host(self):
+        service = self.create_service('web', net='host')
+        container = service.start_container().inspect()
+        self.assertEqual(container['HostConfig']['NetworkMode'], 'host')

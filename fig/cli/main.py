@@ -6,6 +6,7 @@ import re
 import signal
 
 from inspect import getdoc
+import dockerpty
 
 from .. import __version__
 from ..project import NoSuchService, ConfigurationError
@@ -18,7 +19,6 @@ from .utils import yesno
 from ..packages.docker.errors import APIError
 from .errors import UserError
 from .docopt_command import NoSuchCommand
-from .socketclient import SocketClient
 
 log = logging.getLogger(__name__)
 
@@ -202,21 +202,33 @@ class TopLevelCommand(Command):
 
             $ fig run web python manage.py shell
 
-        Note that this will not start any services that the command's service
-        links to. So if, for example, your one-off command talks to your
-        database, you will need to run `fig up -d db` first.
+        By default, linked services will be started, unless they are already
+        running. If you do not want to start linked services, use
+        `fig run --no-deps SERVICE COMMAND [ARGS...]`.
 
         Usage: run [options] SERVICE COMMAND [ARGS...]
 
         Options:
-            -d    Detached mode: Run container in the background, print new
-                  container name
-            -p    Allocate ports as defined in fig.yml
-            -T    Disable pseudo-tty allocation. By default `fig run`
-                  allocates a TTY.
-            --rm  Remove container after run. Ignored in detached mode.
+            -d         Detached mode: Run container in the background, print
+                       new container name.
+            -p         Allocate ports as defined in fig.yml
+            -T         Disable pseudo-tty allocation. By default `fig run`
+                       allocates a TTY.
+            --rm       Remove container after run. Ignored in detached mode.
+            --no-deps  Don't start linked services.
         """
+
         service = self.project.get_service(options['SERVICE'])
+
+        if not options['--no-deps']:
+            deps = service.get_linked_names()
+
+            if len(deps) > 0:
+                self.project.up(
+                    service_names=deps,
+                    start_links=True,
+                    recreate=False,
+                )
 
         tty = True
         if options['-d'] or options['-T'] or not sys.stdin.isatty():
@@ -233,9 +245,8 @@ class TopLevelCommand(Command):
             service.start_container(container, ports=ports, one_off=True)
             print(container.name)
         else:
-            with self._attach_to_container(container.id, raw=tty) as c:
-                service.start_container(container, ports=ports, one_off=True)
-                c.run()
+            service.start_container(container, ports=ports, one_off=True)
+            dockerpty.start(self.client, container.id)
             exit_code = container.wait()
             if options['--rm']:
                 log.info("Removing %s..." % container.name)
@@ -295,17 +306,29 @@ class TopLevelCommand(Command):
 
         If there are existing containers for a service, `fig up` will stop
         and recreate them (preserving mounted volumes with volumes-from),
-        so that changes in `fig.yml` are picked up.
+        so that changes in `fig.yml` are picked up. If you do not want existing
+        containers to be recreated, `fig up --no-recreate` will re-use existing
+        containers.
 
         Usage: up [options] [SERVICE...]
 
         Options:
-            -d    Detached mode: Run containers in the background, print new
-                  container names
+            -d             Detached mode: Run containers in the background,
+                           print new container names.
+            --no-deps      Don't start linked services.
+            --no-recreate  If containers already exist, don't recreate them.
         """
         detached = options['-d']
 
-        to_attach = self.project.up(service_names=options['SERVICE'])
+        start_links = not options['--no-deps']
+        recreate = not options['--no-recreate']
+        service_names = options['SERVICE']
+
+        to_attach = self.project.up(
+            service_names=service_names,
+            start_links=start_links,
+            recreate=recreate
+        )
 
         if not detached:
             print("Attaching to", list_containers(to_attach))
@@ -315,24 +338,12 @@ class TopLevelCommand(Command):
                 log_printer.run()
             finally:
                 def handler(signal, frame):
-                    self.project.kill(service_names=options['SERVICE'])
+                    self.project.kill(service_names=service_names)
                     sys.exit(0)
                 signal.signal(signal.SIGINT, handler)
 
                 print("Gracefully stopping... (press Ctrl+C again to force)")
-                self.project.stop(service_names=options['SERVICE'])
-
-    def _attach_to_container(self, container_id, raw=False):
-        socket_in = self.client.attach_socket(container_id, params={'stdin': 1, 'stream': 1})
-        socket_out = self.client.attach_socket(container_id, params={'stdout': 1, 'logs': 1, 'stream': 1})
-        socket_err = self.client.attach_socket(container_id, params={'stderr': 1, 'logs': 1, 'stream': 1})
-
-        return SocketClient(
-            socket_in=socket_in,
-            socket_out=socket_out,
-            socket_err=socket_err,
-            raw=raw,
-        )
+                self.project.stop(service_names=service_names)
 
 def list_containers(containers):
     return ", ".join(c.name for c in containers)

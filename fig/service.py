@@ -5,13 +5,13 @@ import logging
 import re
 import os
 import sys
-import json
 from .container import Container
+from .progress_stream import stream_output, StreamOutputError
 
 log = logging.getLogger(__name__)
 
 
-DOCKER_CONFIG_KEYS = ['image', 'command', 'hostname', 'user', 'detach', 'stdin_open', 'tty', 'mem_limit', 'ports', 'environment', 'dns', 'volumes', 'volumes_from', 'entrypoint', 'privileged']
+DOCKER_CONFIG_KEYS = ['image', 'command', 'hostname', 'user', 'detach', 'stdin_open', 'tty', 'mem_limit', 'ports', 'environment', 'dns', 'volumes', 'entrypoint', 'privileged', 'volumes_from', 'net']
 DOCKER_CONFIG_HINTS = {
     'link'      : 'links',
     'port'      : 'ports',
@@ -20,6 +20,8 @@ DOCKER_CONFIG_HINTS = {
     'privilige' : 'privileged',
     'volume'    : 'volumes',
 }
+
+VALID_NAME_CHARS = '[a-zA-Z0-9]'
 
 
 class BuildError(Exception):
@@ -37,11 +39,11 @@ class ConfigError(ValueError):
 
 
 class Service(object):
-    def __init__(self, name, client=None, project='default', links=[], base_dir='.', **options):
-        if not re.match('^[a-zA-Z0-9]+$', name):
-            raise ConfigError('Invalid name: %s' % name)
-        if not re.match('^[a-zA-Z0-9]+$', project):
-            raise ConfigError('Invalid project: %s' % project)
+    def __init__(self, name, client=None, project='default', links=[], volumes_from=[], base_dir='.', **options):
+        if not re.match('^%s+$' % VALID_NAME_CHARS, name):
+            raise ConfigError('Invalid service name "%s" - only %s are allowed' % (name, VALID_NAME_CHARS))
+        if not re.match('^%s+$' % VALID_NAME_CHARS, project):
+            raise ConfigError('Invalid project name "%s" - only %s are allowed' % (project, VALID_NAME_CHARS))
         if 'image' in options and 'build' in options:
             raise ConfigError('Service %s has both an image and build path specified. A service can either be built to image or use an existing image, not both.' % name)
 
@@ -58,6 +60,7 @@ class Service(object):
         self.client = client
         self.project = project
         self.links = links or []
+        self.volumes_from = volumes_from or []
         self.base_dir = base_dir
         self.options = options
 
@@ -74,9 +77,7 @@ class Service(object):
 
     def start(self, **options):
         for c in self.containers(stopped=True):
-            if not c.is_running:
-                log.info("Starting %s..." % c.name)
-                self.start_container(c, **options)
+            self.start_container_if_stopped(c, **options)
 
     def stop(self, **options):
         for c in self.containers():
@@ -182,7 +183,6 @@ class Service(object):
         intermediate_container = Container.create(
             self.client,
             image=container.image,
-            volumes_from=container.id,
             entrypoint=['echo'],
             command=[],
         )
@@ -191,15 +191,21 @@ class Service(object):
         container.remove()
 
         options = dict(override_options)
-        options['volumes_from'] = intermediate_container.id
         new_container = self.create_container(**options)
-        self.start_container(new_container, volumes_from=intermediate_container.id)
+        self.start_container(new_container, intermediate_container=intermediate_container)
 
         intermediate_container.remove()
 
         return (intermediate_container, new_container)
 
-    def start_container(self, container=None, volumes_from=None, **override_options):
+    def start_container_if_stopped(self, container, **options):
+        if container.is_running:
+            return container
+        else:
+            log.info("Starting %s..." % container.name)
+            return self.start_container(container, **options)
+
+    def start_container(self, container=None, intermediate_container=None,**override_options):
         if container is None:
             container = self.create_container(**override_options)
 
@@ -210,12 +216,7 @@ class Service(object):
 
         if options.get('ports', None) is not None:
             for port in options['ports']:
-                port = str(port)
-                if ':' in port:
-                    external_port, internal_port = port.split(':', 1)
-                else:
-                    external_port, internal_port = (None, port)
-
+                internal_port, external_port = split_port(port)
                 port_bindings[internal_port] = external_port
 
         volume_bindings = {}
@@ -232,15 +233,30 @@ class Service(object):
                     }
 
         privileged = options.get('privileged', False)
+        net = options.get('net', 'bridge')
 
         container.start(
             links=self._get_links(link_to_self=override_options.get('one_off', False)),
             port_bindings=port_bindings,
             binds=volume_bindings,
-            volumes_from=volumes_from,
+            volumes_from=self._get_volumes_from(intermediate_container),
             privileged=privileged,
+            network_mode=net,
         )
         return container
+
+    def start_or_create_containers(self):
+        containers = self.containers(stopped=True)
+
+        if len(containers) == 0:
+            log.info("Creating %s..." % self.next_container_name())
+            new_container = self.create_container()
+            return [self.start_container(new_container)]
+        else:
+            return [self.start_container_if_stopped(c) for c in containers]
+
+    def get_linked_names(self):
+        return [s.name for (s, _) in self.links]
 
     def next_container_name(self, one_off=False):
         bits = [self.project, self.name]
@@ -269,6 +285,20 @@ class Service(object):
                 links.append((container.name, container.name))
                 links.append((container.name, container.name_without_project))
         return links
+
+    def _get_volumes_from(self, intermediate_container=None):
+        volumes_from = []
+        for v in self.volumes_from:
+            if isinstance(v, Service):
+                for container in v.containers(stopped=True):
+                    volumes_from.append(container.id)
+            elif isinstance(v, Container):
+                volumes_from.append(v.id)
+
+        if intermediate_container:
+            volumes_from.append(intermediate_container.id)
+
+        return volumes_from
 
     def _get_container_create_options(self, override_options, one_off=False):
         container_options = dict((k, self.options[k]) for k in DOCKER_CONFIG_KEYS if k in self.options)
@@ -299,6 +329,10 @@ class Service(object):
         # Priviliged is only required for starting containers, not for creating them
         if 'privileged' in container_options:
             del container_options['privileged']
+
+        # net is only required for starting containers, not for creating them
+        if 'net' in container_options:
+            del container_options['net']
 
         return container_options
 
@@ -346,84 +380,6 @@ class Service(object):
         return True
 
 
-class StreamOutputError(Exception):
-    pass
-
-
-def stream_output(output, stream):
-    is_terminal = hasattr(stream, 'fileno') and os.isatty(stream.fileno())
-    all_events = []
-    lines = {}
-    diff = 0
-
-    for chunk in output:
-        event = json.loads(chunk)
-        all_events.append(event)
-
-        if 'progress' in event or 'progressDetail' in event:
-            image_id = event['id']
-
-            if image_id in lines:
-                diff = len(lines) - lines[image_id]
-            else:
-                lines[image_id] = len(lines)
-                stream.write("\n")
-                diff = 0
-
-            if is_terminal:
-                # move cursor up `diff` rows
-                stream.write("%c[%dA" % (27, diff))
-
-        print_output_event(event, stream, is_terminal)
-
-        if 'id' in event and is_terminal:
-            # move cursor back down
-            stream.write("%c[%dB" % (27, diff))
-
-        stream.flush()
-
-    return all_events
-
-def print_output_event(event, stream, is_terminal):
-    if 'errorDetail' in event:
-        raise StreamOutputError(event['errorDetail']['message'])
-
-    terminator = ''
-
-    if is_terminal and 'stream' not in event:
-        # erase current line
-        stream.write("%c[2K\r" % 27)
-        terminator = "\r"
-        pass
-    elif 'progressDetail' in event:
-        return
-
-    if 'time' in event:
-        stream.write("[%s] " % event['time'])
-
-    if 'id' in event:
-        stream.write("%s: " % event['id'])
-
-    if 'from' in event:
-        stream.write("(from %s) " % event['from'])
-
-    status = event.get('status', '')
-
-    if 'progress' in event:
-        stream.write("%s %s%s" % (status, event['progress'], terminator))
-    elif 'progressDetail' in event:
-        detail = event['progressDetail']
-        if 'current' in detail:
-            percentage = float(detail['current']) / float(detail['total']) * 100
-            stream.write('%s (%.1f%%)%s' % (status, percentage, terminator))
-        else:
-            stream.write('%s%s' % (status, terminator))
-    elif 'stream' in event:
-        stream.write("%s%s" % (event['stream'], terminator))
-    else:
-        stream.write("%s%s\n" % (status, terminator))
-
-
 NAME_RE = re.compile(r'^([^_]+)_([^_]+)_(run_)?(\d+)$')
 
 
@@ -464,3 +420,21 @@ def split_volume(v):
         return v.split(':', 1)
     else:
         return (None, v)
+
+
+def split_port(port):
+    port = str(port)
+    external_ip = None
+    if ':' in port:
+        external_port, internal_port = port.rsplit(':', 1)
+        if ':' in external_port:
+            external_ip, external_port = external_port.split(':', 1)
+    else:
+        external_port, internal_port = (None, port)
+    if external_ip:
+        if external_port:
+            external_port = (external_ip, external_port)
+        else:
+            external_port = (external_ip,)
+    return internal_port, external_port
+
